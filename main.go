@@ -6,12 +6,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
-	"reflect"
 	"strings"
 )
 
-var nameLen int
+var nameLen = 8
 
 type ProcessLogger struct {
 	w    io.Writer
@@ -37,18 +37,27 @@ func (pl *ProcessLogger) Write(v []byte) (int, error) {
 	return len(v), nil
 }
 
-type Process struct {
-	cmd *exec.Cmd
+type Command struct {
 	id  int
-	ch  chan error
+	cmd *exec.Cmd
 }
 
+type processError struct {
+	id  int
+	err error
+}
+
+var logger = &ProcessLogger{os.Stderr, 0, "parallel"}
+
 func main() {
-	var processes = make([]*Process, 0, len(os.Args)-1)
+	var commands = make([]*Command, 0, len(os.Args)-1)
 
-	nameLen = len("parallel")
-	logger := &ProcessLogger{os.Stderr, 0, "parallel"}
+	sigchan := make(chan os.Signal, 1)
+	signal.Notify(sigchan, os.Interrupt)
 
+	cmdLen := len(os.Args) - 1
+
+	pchan := make(chan processError, cmdLen)
 	for id, cmd := range os.Args[1:] {
 		id++
 
@@ -56,49 +65,45 @@ func main() {
 		processName := filepath.Base(args[0])
 		nameLen = max(nameLen, len(processName))
 
-		process := exec.Command(args[0], args[1:]...)
-		process.Stdout = &ProcessLogger{os.Stdout, id, processName}
-		process.Stderr = &ProcessLogger{os.Stderr, id, processName}
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Stdout = &ProcessLogger{os.Stdout, id, processName}
+		cmd.Stderr = &ProcessLogger{os.Stderr, id, processName}
 
-		pchan := make(chan error, 1)
-		go func(id int, process *exec.Cmd, pchan chan error) {
-			err := process.Start()
+		go func(id int, cmd *exec.Cmd) {
+			err := cmd.Start()
 			if err != nil {
-				pchan <- err
+				pchan <- processError{id, err}
 			}
-			fmt.Fprintf(logger, "Process %s (#%d) is running\n", process.Path, id)
-			pchan <- process.Wait()
-		}(id, process, pchan)
 
-		processes = append(processes, &Process{
-			cmd: process,
-			ch:  pchan,
+			fmt.Fprintf(logger, "Process %s (#%d) is running\n", cmd.Path, id)
+			pchan <- processError{id, cmd.Wait()}
+		}(id, cmd)
+
+		commands = append(commands, &Command{
+			id:  id,
+			cmd: cmd,
 		})
 	}
 
 	for {
-		if len(processes) == 0 {
+		if cmdLen == 0 {
 			break
 		}
 
-		cases := make([]reflect.SelectCase, len(processes))
-		for i, pchan := range processes {
-			cases[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(pchan.ch)}
-		}
+		select {
+		case perr := <-pchan:
+			if perr.err != nil {
+				fmt.Fprintf(logger, "process throws an error: %s\n", perr.err.Error())
+			}
+			cmdLen--
 
-		chosen, value, notClosed := reflect.Select(cases)
-		process := processes[chosen]
-		if notClosed {
-			close(process.ch)
-		}
+		case <-sigchan:
+			fmt.Fprintf(logger, "Interrupt signal received\n")
 
-		err, ok := value.Interface().(error)
-		if ok && err != nil {
-			fmt.Fprintf(logger, "process throws an error: %s\n", err.Error())
+			for _, process := range commands {
+				process.cmd.Process.Signal(os.Interrupt)
+			}
 		}
-
-		processes[chosen] = processes[len(processes)-1]
-		processes = processes[:len(processes)-1]
 	}
 
 	fmt.Fprintln(logger, "All processes were closed")
